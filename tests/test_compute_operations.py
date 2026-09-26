@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from app.compute.service import ComputeOperationsService
 from app.core.clock import FrozenClock
 from app.database import get_connection, transaction
+from app.workers.service import WorkerRegistryService
 
 
 TEMPLATE = {
@@ -38,6 +39,15 @@ def create_template(client) -> None:
     assert response.status_code == 201, response.text
 
 
+def register_worker(client, worker_key: str, capabilities: list[str], max_concurrency: int = 4) -> str:
+    response = client.post(
+        "/api/workers",
+        json={"worker_key": worker_key, "software_version": "1.0.0", "capabilities": capabilities, "max_concurrency": max_concurrency},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["session_id"]
+
+
 def test_template_submission_idempotency_and_parameter_validation(client):
     create_template(client)
     first = client.post("/api/compute/tasks", json=submit_payload("request-000001"))
@@ -54,14 +64,16 @@ def test_priority_capability_claim_and_result_version(client):
     create_template(client)
     low = client.post("/api/compute/tasks", json=submit_payload("priority-low", priority=10)).json()
     high = client.post("/api/compute/tasks", json=submit_payload("priority-high", priority=90)).json()
-    no_match = client.post("/api/compute/tasks/claim", json={"worker_id": "w0", "capabilities": ["other"], "lease_seconds": 60})
+    other_session = register_worker(client, "w0", ["other"])
+    no_match = client.post("/api/compute/tasks/claim", json={"worker_id": "w0", "session_id": other_session, "capabilities": ["other"], "lease_seconds": 60})
     assert no_match.status_code == 200 and no_match.json()["task"] is None
-    claimed = client.post("/api/compute/tasks/claim", json={"worker_id": "w1", "capabilities": ["solver-a"], "lease_seconds": 60})
+    session = register_worker(client, "w1", ["solver-a"])
+    claimed = client.post("/api/compute/tasks/claim", json={"worker_id": "w1", "session_id": session, "capabilities": ["solver-a"], "lease_seconds": 60})
     assert claimed.status_code == 200
     assert claimed.json()["task"]["id"] == high["id"]
     completed = client.post(
         f"/api/compute/tasks/{high['id']}/complete",
-        json={"worker_id": "w1", "result": {"value": 3.14}, "metrics": {"seconds": 2}},
+        json={"worker_id": "w1", "session_id": session, "result": {"value": 3.14}, "metrics": {"seconds": 2}},
     )
     assert completed.status_code == 200
     details = client.get(f"/api/compute/task-details/{high['id']}").json()
@@ -102,15 +114,18 @@ def test_failure_backoff_and_expired_lease_recovery(client):
     init_db()
     clock = FrozenClock(datetime(2026, 9, 26, 2, 0, tzinfo=UTC))
     service = ComputeOperationsService(get_connection(), clock)
+    registry = WorkerRegistryService(get_connection(), clock)
     service.create_template(TEMPLATE, "administrator")
+    worker = registry.register({"worker_key": "worker-a", "software_version": "1.0.0", "capabilities": ["solver-a"], "max_concurrency": 2})
+    session = worker["session_id"]
     first = service.submit(submit_payload("failure-000001"))
-    claimed = service.claim("worker-a", ["solver-a"], 10)
+    claimed = service.claim("worker-a", session, ["solver-a"], 10)
     assert claimed and claimed["id"] == first["id"]
-    failed = service.fail(first["id"], "worker-a", "numeric_error", "数值不收敛", True)
+    failed = service.fail(first["id"], "worker-a", session, "numeric_error", "数值不收敛", True)
     assert failed["status"] == "queued"
     assert failed["available_at"] > failed["updated_at"]
     clock.advance(seconds=2)
-    claimed_again = service.claim("worker-a", ["solver-a"], 10)
+    claimed_again = service.claim("worker-a", session, ["solver-a"], 10)
     assert claimed_again and claimed_again["attempt_count"] == 2
     clock.advance(seconds=11)
     recovered = service.recover_expired()

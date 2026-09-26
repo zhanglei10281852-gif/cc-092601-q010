@@ -67,9 +67,16 @@ def command_compute_demo() -> int:
                 "idempotency_key": "compute-demo-000001",
             },
         )
+        worker = client.post(
+            "/api/workers",
+            json={"worker_key": "cli-worker", "software_version": "1.0.0", "capabilities": ["monte-carlo"], "max_concurrency": 2},
+        )
+        if worker.status_code != 201:
+            print(worker.text)
+            return 1
         claimed = client.post(
             "/api/compute/tasks/claim",
-            json={"worker_id": "cli-worker", "capabilities": ["monte-carlo"], "lease_seconds": 60},
+            json={"worker_id": "cli-worker", "session_id": worker.json()["session_id"], "capabilities": ["monte-carlo"], "lease_seconds": 60},
         )
     result = {"task": task.status_code, "claimed": claimed.status_code, "task_id": task.json().get("id")}
     print(json.dumps(result, ensure_ascii=False))

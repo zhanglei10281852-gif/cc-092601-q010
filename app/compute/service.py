@@ -10,6 +10,7 @@ from app.compute.repository import ComputeRepository
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
+from app.workers.service import assert_claimable, ensure_schema as ensure_worker_schema, lease_owner, record_outcome, require_current_session
 
 
 def digest(value: Any) -> str:
@@ -21,6 +22,7 @@ class ComputeOperationsService:
     """管理计算模板、配额、任务租约、结果版本和人工干预。"""
 
     def __init__(self, connection: sqlite3.Connection | None = None, clock: Clock | None = None) -> None:
+        ensure_worker_schema()
         self.connection = connection or get_connection()
         self.clock = clock or SystemClock()
         self.repository = ComputeRepository(self.connection)
@@ -82,45 +84,54 @@ class ComputeOperationsService:
         result["interventions"] = self.repository.interventions(task_id)
         return result
 
-    def claim(self, worker_id: str, capabilities: list[str], lease_seconds: int) -> dict[str, Any] | None:
+    def claim(self, worker_id: str, session_id: str, capabilities: list[str], lease_seconds: int) -> dict[str, Any] | None:
         now_value = self.clock.now()
         now = to_storage(now_value)
         lease_until = to_storage(now_value + timedelta(seconds=lease_seconds))
         with transaction(immediate=True) as connection:
+            worker = assert_claimable(connection, now, worker_id, session_id)
+            registered = set(json.loads(worker["capabilities_json"]))
+            requested = set(capabilities)
+            if not requested.issubset(registered):
+                raise ValidationError("工作者声明了未注册的能力", context={"unregistered": sorted(requested - registered)})
+            effective = sorted(requested) if requested else sorted(registered)
             repository = ComputeRepository(connection)
-            candidate = repository.queued_candidate(capabilities, now)
+            candidate = repository.queued_candidate(effective, now)
             if candidate is None:
                 return None
             cursor = connection.execute(
                 "UPDATE compute_tasks SET status='running',attempt_count=attempt_count+1,lease_owner=?,lease_expires_at=?,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 WHERE id=? AND status='queued'",
-                (worker_id, lease_until, now, now, candidate["id"]),
+                (lease_owner(worker_id, session_id), lease_until, now, now, candidate["id"]),
             )
             if cursor.rowcount != 1:
                 return None
             return dict(repository.task_by_id(candidate["id"]))
 
-    def heartbeat(self, task_id: int, worker_id: str, lease_seconds: int) -> dict[str, Any]:
+    def heartbeat(self, task_id: int, worker_id: str, session_id: str, lease_seconds: int) -> dict[str, Any]:
         now_value = self.clock.now()
         now = to_storage(now_value)
         expires = to_storage(now_value + timedelta(seconds=lease_seconds))
         with transaction(immediate=True) as connection:
+            require_current_session(connection, worker_id, session_id)
             cursor = connection.execute(
                 "UPDATE compute_tasks SET lease_expires_at=?,updated_at=?,version=version+1 WHERE id=? AND status='running' AND lease_owner=?",
-                (expires, now, task_id, worker_id),
+                (expires, now, task_id, lease_owner(worker_id, session_id)),
             )
             if cursor.rowcount != 1:
                 raise ConflictError("任务未由当前工作者持有")
+            connection.execute("UPDATE compute_workers SET last_heartbeat_at=?,updated_at=? WHERE worker_key=?", (now, now, worker_id))
             return dict(ComputeRepository(connection).task_by_id(task_id))
 
-    def complete(self, task_id: int, worker_id: str, result: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
+    def complete(self, task_id: int, worker_id: str, session_id: str, result: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
         now = to_storage(self.clock.now())
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
             task = repository.task_by_id(task_id)
             if task is None:
                 raise NotFoundError("计算任务不存在")
-            if task["status"] != "running" or task["lease_owner"] != worker_id:
+            if task["status"] != "running" or task["lease_owner"] != lease_owner(worker_id, session_id):
                 raise ConflictError("任务未由当前工作者持有")
+            require_current_session(connection, worker_id, session_id)
             version = int(connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM compute_results WHERE task_id=?", (task_id,)).fetchone()[0])
             connection.execute(
                 "INSERT INTO compute_results(task_id,version,result_json,metrics_json,result_digest,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -130,9 +141,10 @@ class ComputeOperationsService:
                 "UPDATE compute_tasks SET status='succeeded',current_result_version=?,lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
                 (version, now, now, task_id),
             )
+            record_outcome(connection, now, worker_id, succeeded=True, task_id=task_id)
             return dict(repository.task_by_id(task_id))
 
-    def fail(self, task_id: int, worker_id: str, error_code: str, message: str, retryable: bool) -> dict[str, Any]:
+    def fail(self, task_id: int, worker_id: str, session_id: str, error_code: str, message: str, retryable: bool) -> dict[str, Any]:
         now_value = self.clock.now()
         now = to_storage(now_value)
         with transaction(immediate=True) as connection:
@@ -140,8 +152,9 @@ class ComputeOperationsService:
             task = repository.task_by_id(task_id)
             if task is None:
                 raise NotFoundError("计算任务不存在")
-            if task["status"] != "running" or task["lease_owner"] != worker_id:
+            if task["status"] != "running" or task["lease_owner"] != lease_owner(worker_id, session_id):
                 raise ConflictError("任务未由当前工作者持有")
+            require_current_session(connection, worker_id, session_id)
             can_retry = retryable and int(task["attempt_count"]) < int(task["max_attempts"])
             status = "queued" if can_retry else "failed"
             delay = min(300, 2 ** max(0, int(task["attempt_count"]) - 1)) if can_retry else 0
@@ -150,6 +163,7 @@ class ComputeOperationsService:
                 "UPDATE compute_tasks SET status=?,available_at=?,lease_owner='',lease_expires_at='',last_error_code=?,last_error_message=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?",
                 (status, available, error_code, message[:2000], None if can_retry else now, now, task_id),
             )
+            record_outcome(connection, now, worker_id, succeeded=False, task_id=task_id, error_code=error_code)
             return dict(repository.task_by_id(task_id))
 
     def cancel(self, task_id: int, actor: str, reason: str, batch_key: str = "") -> dict[str, Any]:
