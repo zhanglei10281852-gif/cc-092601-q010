@@ -257,6 +257,7 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
     max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
     available_at TEXT NOT NULL,
     lease_owner TEXT NOT NULL DEFAULT '',
+    lease_instance_id TEXT NOT NULL DEFAULT '',
     lease_expires_at TEXT NOT NULL DEFAULT '',
     current_result_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
@@ -293,6 +294,44 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+CREATE TABLE IF NOT EXISTS compute_workers (
+    worker_id TEXT PRIMARY KEY,
+    current_instance_id TEXT NOT NULL,
+    software_version TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL DEFAULT '[]',
+    max_concurrency INTEGER NOT NULL CHECK(max_concurrency > 0),
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','stopped','quarantined')),
+    succeeded_count INTEGER NOT NULL DEFAULT 0 CHECK(succeeded_count >= 0),
+    failed_count INTEGER NOT NULL DEFAULT 0 CHECK(failed_count >= 0),
+    consecutive_failures INTEGER NOT NULL DEFAULT 0 CHECK(consecutive_failures >= 0),
+    recent_failures_json TEXT NOT NULL DEFAULT '[]',
+    last_heartbeat_at TEXT NOT NULL DEFAULT '',
+    registered_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS compute_worker_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_id TEXT NOT NULL REFERENCES compute_workers(worker_id) ON DELETE CASCADE,
+    instance_id TEXT NOT NULL UNIQUE,
+    software_version TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    last_heartbeat_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL DEFAULT '',
+    end_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_open_session
+    ON compute_worker_sessions(worker_id) WHERE ended_at='';
+CREATE INDEX IF NOT EXISTS idx_worker_sessions_worker ON compute_worker_sessions(worker_id,id);
+CREATE TABLE IF NOT EXISTS compute_worker_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_id TEXT NOT NULL REFERENCES compute_workers(worker_id) ON DELETE CASCADE,
+    action TEXT NOT NULL CHECK(action IN ('quarantined','released','disabled','enabled')),
+    reason TEXT NOT NULL,
+    basis_json TEXT NOT NULL DEFAULT '{}',
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_worker_events_worker ON compute_worker_events(worker_id,id);
 '''
 
 PERMISSIONS = [
@@ -359,10 +398,23 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _ensure_columns(connection: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    """为既有数据库补齐新增列（CREATE TABLE IF NOT EXISTS 不会更新已存在的表）。"""
+    existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, declaration in columns.items():
+        if name not in existing:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _ensure_columns(
+            connection,
+            "compute_tasks",
+            {"lease_instance_id": "TEXT NOT NULL DEFAULT ''"},
+        )
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

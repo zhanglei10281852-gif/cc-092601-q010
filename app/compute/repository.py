@@ -102,3 +102,64 @@ class ComputeRepository:
             values,
         ).fetchall()
         return [dict(row) for row in rows]
+
+    # ----- 工作者注册表 -----
+
+    def worker_by_id(self, worker_id: str) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM compute_workers WHERE worker_id=?", (worker_id,)).fetchone()
+
+    def list_workers(self, *, status: str | None = None, limit: int = 100) -> list[sqlite3.Row]:
+        if status:
+            rows = self.connection.execute(
+                "SELECT * FROM compute_workers WHERE status=? ORDER BY worker_id LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        else:
+            rows = self.connection.execute("SELECT * FROM compute_workers ORDER BY worker_id LIMIT ?", (limit,)).fetchall()
+        return list(rows)
+
+    def active_lease_count(self, worker_id: str) -> int:
+        return int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM compute_tasks WHERE status='running' AND lease_owner=?",
+                (worker_id,),
+            ).fetchone()[0]
+        )
+
+    def active_leases(self, worker_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT t.id,t.template_id,tpl.algorithm AS task_algorithm,t.lease_expires_at,t.lease_instance_id,t.started_at,t.attempt_count "
+            "FROM compute_tasks t JOIN compute_templates tpl ON tpl.id=t.template_id "
+            "WHERE t.status='running' AND t.lease_owner=? ORDER BY t.id",
+            (worker_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def open_session_for_worker(self, worker_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM compute_worker_sessions WHERE worker_id=? AND ended_at=''",
+            (worker_id,),
+        ).fetchone()
+
+    def session_by_instance(self, instance_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM compute_worker_sessions WHERE instance_id=?",
+            (instance_id,),
+        ).fetchone()
+
+    def worker_events(self, worker_id: str) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM compute_worker_events WHERE worker_id=? ORDER BY id",
+                (worker_id,),
+            ).fetchall()
+        ]
+
+    def add_worker_event(self, *, worker_id: str, action: str, reason: str, basis: dict[str, Any], actor: str, now: str) -> dict[str, Any]:
+        cursor = self.connection.execute(
+            "INSERT INTO compute_worker_events(worker_id,action,reason,basis_json,actor,created_at) VALUES(?,?,?,?,?,?)",
+            (worker_id, action, reason, json.dumps(basis, ensure_ascii=False, sort_keys=True), actor, now),
+        )
+        row = self.connection.execute("SELECT * FROM compute_worker_events WHERE id=?", (cursor.lastrowid,)).fetchone()
+        return dict(row)

@@ -2,7 +2,22 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
+from app.compute.schemas import (
+    BatchOperation,
+    CancelRequest,
+    PriorityRequest,
+    QuotaSet,
+    RetryRequest,
+    TaskClaim,
+    TaskFailure,
+    TaskResult,
+    TaskSubmit,
+    TemplateCreate,
+    WorkerEnabled,
+    WorkerHeartbeat,
+    WorkerRegister,
+    WorkerRelease,
+)
 from app.compute.service import ComputeOperationsService
 
 router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
@@ -42,24 +57,59 @@ def get_task(task_id: int):
     return service().get_task(task_id)
 
 
+@router.post("/workers/register", status_code=201)
+def register_worker(payload: WorkerRegister):
+    return service().register_worker(payload.model_dump())
+
+
+@router.post("/workers/{worker_id}/heartbeat")
+def worker_heartbeat(worker_id: str, payload: WorkerHeartbeat):
+    return service().worker_heartbeat(worker_id, payload.instance_id)
+
+
+@router.get("/workers")
+def list_workers(status: str | None = Query(default=None, pattern=r"^(active|stopped|quarantined)$"), limit: int = Query(default=100, ge=1, le=500)):
+    return service().list_workers(status=status, limit=limit)
+
+
+@router.get("/workers/{worker_id}")
+def get_worker(worker_id: str):
+    return service().get_worker(worker_id)
+
+
+@router.post("/workers/{worker_id}/quarantine")
+def quarantine_worker(worker_id: str, payload: WorkerRelease):
+    return service().quarantine_worker(worker_id, payload.actor, payload.reason)
+
+
+@router.post("/workers/{worker_id}/release")
+def release_worker(worker_id: str, payload: WorkerRelease):
+    return service().release_worker(worker_id, payload.actor, payload.reason)
+
+
+@router.post("/workers/{worker_id}/enabled")
+def set_worker_enabled(worker_id: str, payload: WorkerEnabled):
+    return service().set_worker_enabled(worker_id, payload.actor, payload.reason, payload.enabled)
+
+
 @router.post("/tasks/claim")
 def claim_task(payload: TaskClaim):
-    return {"task": service().claim(payload.worker_id, payload.capabilities, payload.lease_seconds)}
+    return {"task": service().claim(payload.worker_id, payload.instance_id, payload.capabilities, payload.lease_seconds)}
 
 
 @router.post("/tasks/{task_id}/heartbeat")
 def heartbeat(task_id: int, payload: TaskClaim):
-    return service().heartbeat(task_id, payload.worker_id, payload.lease_seconds)
+    return service().heartbeat(task_id, payload.worker_id, payload.instance_id, payload.lease_seconds)
 
 
 @router.post("/tasks/{task_id}/complete")
 def complete_task(task_id: int, payload: TaskResult):
-    return service().complete(task_id, payload.worker_id, payload.result, payload.metrics)
+    return service().complete(task_id, payload.worker_id, payload.instance_id, payload.result, payload.metrics)
 
 
 @router.post("/tasks/{task_id}/fail")
 def fail_task(task_id: int, payload: TaskFailure):
-    return service().fail(task_id, payload.worker_id, payload.error_code, payload.message, payload.retryable)
+    return service().fail(task_id, payload.worker_id, payload.instance_id, payload.error_code, payload.message, payload.retryable)
 
 
 @router.post("/tasks/{task_id}/cancel")

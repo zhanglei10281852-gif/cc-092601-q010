@@ -27,6 +27,9 @@ class Settings:
     default_page_size: int
     audit_retention_days: int
     job_lease_seconds: int
+    worker_min_version: str
+    worker_failure_threshold: int
+    worker_offline_seconds: int
 
     @classmethod
     def load(cls) -> "Settings":
@@ -34,6 +37,9 @@ class Settings:
         database = Path(os.getenv("TOWNSHIP_DATABASE_PATH", str(default_database))).expanduser().resolve()
         if database.suffix.casefold() not in {".db", ".sqlite", ".sqlite3"}:
             raise ValidationError("数据库文件必须使用 .db、.sqlite 或 .sqlite3 后缀")
+        min_version = os.getenv("TOWNSHIP_WORKER_MIN_VERSION", "1.0.0").strip()
+        if not min_version:
+            raise ValidationError("配置 TOWNSHIP_WORKER_MIN_VERSION 不能为空")
         return cls(
             database_path=database,
             session_ttl_minutes=_positive_integer("TOWNSHIP_SESSION_TTL_MINUTES", 480, maximum=43_200),
@@ -42,6 +48,9 @@ class Settings:
             default_page_size=_positive_integer("TOWNSHIP_DEFAULT_PAGE_SIZE", 20, maximum=100),
             audit_retention_days=_positive_integer("TOWNSHIP_AUDIT_RETENTION_DAYS", 365, maximum=3650),
             job_lease_seconds=_positive_integer("TOWNSHIP_JOB_LEASE_SECONDS", 60, maximum=3600),
+            worker_min_version=min_version,
+            worker_failure_threshold=_positive_integer("TOWNSHIP_WORKER_FAILURE_THRESHOLD", 3, maximum=10000),
+            worker_offline_seconds=_positive_integer("TOWNSHIP_WORKER_OFFLINE_SECONDS", 90, maximum=86400),
         )
 
     def public_view(self) -> dict:
@@ -53,4 +62,7 @@ class Settings:
             "default_page_size": self.default_page_size,
             "audit_retention_days": self.audit_retention_days,
             "job_lease_seconds": self.job_lease_seconds,
+            "worker_min_version": self.worker_min_version,
+            "worker_failure_threshold": self.worker_failure_threshold,
+            "worker_offline_seconds": self.worker_offline_seconds,
         }
